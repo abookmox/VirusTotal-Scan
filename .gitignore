@@ -10,3 +10,6 @@ __pycache__/
 
 # Ignore VSCode settings folder
 .vscode/
+
+# Ignore the file containing the mails processed
+processed_emails.txt

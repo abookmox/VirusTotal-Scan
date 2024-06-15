@@ -104,6 +104,7 @@ def check_link_virustotal(url):
         'x-apikey': VIRUSTOTAL_API_KEY
     }
     try:
+        # Step 1: Submit the URL for analysis
         response = requests.post(
             'https://www.virustotal.com/api/v3/urls',
             headers=headers,
@@ -112,23 +113,37 @@ def check_link_virustotal(url):
         response.raise_for_status()
         
         analysis_id = response.json().get('data', {}).get('id')
-        if analysis_id:
-            analysis_response = requests.get(
-                f'https://www.virustotal.com/api/v3/analyses/{analysis_id}',
-                headers=headers
-            )
-            analysis_response.raise_for_status()
-            
-            result = analysis_response.json()
-            malicious_count = result['data']['attributes']['stats']['malicious']
-            logging.info(f"Checked URL {url}: {malicious_count} malicious reports.")
-            return malicious_count
-        else:
+        if not analysis_id:
             logging.warning(f"Submission failed for URL: {url}")
             return "Error: Submission failed"
+        
+        # Step 2: Polling to get the analysis results
+        analysis_url = f'https://www.virustotal.com/api/v3/analyses/{analysis_id}'
+        for attempt in range(5):  # Retry up to 5 times with delays
+            analysis_response = requests.get(analysis_url, headers=headers)
+            if analysis_response.status_code == 200:
+                result = analysis_response.json()
+                status = result.get('data', {}).get('attributes', {}).get('status')
+                
+                if status == "completed":
+                    # Extract the malicious count
+                    malicious_count = result['data']['attributes']['stats']['malicious']
+                    logging.info(f"Checked URL {url}: {malicious_count} malicious reports.")
+                    return malicious_count
+                
+                logging.info(f"Waiting for analysis results for URL {url}... attempt {attempt + 1}")
+                time.sleep(5)  # Wait for 5 seconds before the next poll
+            else:
+                logging.error(f"Error fetching analysis results for URL {url}: {analysis_response.status_code}")
+                break
+        
+        logging.warning(f"Analysis not completed for URL: {url} after multiple attempts.")
+        return "Error: Analysis not completed"
+
     except RequestException as e:
         logging.error(f"Request failed for URL {url}: {e}")
         return f"Error: Unable to check - {str(e)}"
+
 
 def send_report(report):
     """Send the report via email."""
