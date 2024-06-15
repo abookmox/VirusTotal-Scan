@@ -10,6 +10,7 @@ from email.mime.text import MIMEText
 from dotenv import load_dotenv
 from requests.exceptions import RequestException
 from html import escape
+from bs4 import BeautifulSoup
 
 # Load environment variables from .env file if present
 load_dotenv()
@@ -24,8 +25,24 @@ SMTP_PORT = int(os.getenv('SMTP_PORT', 587))  # Default to 587 if not set
 SMTP_USERNAME = os.getenv('SMTP_USERNAME')
 SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
 
+# File to store processed email IDs
+PROCESSED_EMAILS_FILE = 'processed_emails.txt'
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_processed_emails():
+    """Load the list of processed email IDs from a file."""
+    if not os.path.exists(PROCESSED_EMAILS_FILE):
+        return set()
+    with open(PROCESSED_EMAILS_FILE, 'r') as file:
+        processed_emails = set(line.strip() for line in file.readlines())
+    return processed_emails
+
+def save_processed_email(email_id):
+    """Save a processed email ID to the file."""
+    with open(PROCESSED_EMAILS_FILE, 'a') as file:
+        file.write(f"{email_id}\n")
 
 def access_email():
     """Access and login to the email server."""
@@ -51,11 +68,35 @@ def fetch_unread_emails(mail):
         raise
 
 def extract_links(email_body):
-    """Extract URLs from the email body and sanitize the input."""
-    urls = re.findall(r'(https?://[^\s]+)', email_body)
-    sanitized_urls = [escape(url) for url in urls]
-    logging.info(f"Extracted {len(sanitized_urls)} sanitized URLs.")
-    return sanitized_urls
+    """Extract and clean URLs from the email body."""
+    urls = set()  # Use a set to avoid duplicate URLs
+
+    # Use BeautifulSoup to parse the HTML content
+    soup = BeautifulSoup(email_body, 'html.parser')
+    
+    # Extract all href links
+    for link in soup.find_all('a', href=True):
+        url = link['href']
+        sanitized_url = clean_url(url)
+        urls.add(sanitized_url)
+    
+    # Extract URLs directly from the text using regex as a fallback
+    regex_urls = re.findall(r'(https?://[^\s]+)', email_body)
+    for url in regex_urls:
+        sanitized_url = clean_url(url)
+        urls.add(sanitized_url)
+    
+    logging.info(f"Extracted {len(urls)} sanitized URLs.")
+    return list(urls)
+
+def clean_url(url):
+    """Sanitize and clean a URL."""
+    # Decode HTML entities and remove extra HTML characters
+    clean_url = url.split('&')[0]  # This removes trailing parameters after '&'
+    clean_url = clean_url.split('"')[0]  # This removes trailing characters after '"'
+    clean_url = clean_url.split('<')[0]  # This removes trailing characters after '<'
+    clean_url = clean_url.split('>')[0]  # This removes trailing characters after '>'
+    return clean_url.strip()
 
 def check_link_virustotal(url):
     """Check a single URL on VirusTotal and return the malicious count."""
@@ -146,11 +187,23 @@ def process_email(email_id, mail):
                 malicious_count = check_link_virustotal(url)
                 if isinstance(malicious_count, int) and malicious_count > 0:
                     malicious_report += f"URL: {url}\nMalicious Reports: {malicious_count}\n\n"
+
+        # Mark the email as unread after processing
+        mark_as_unread(mail, email_id)
+        
         return malicious_report
 
     except Exception as e:
         logging.error(f"Failed to process email ID {email_id}: {e}")
         return ""
+
+def mark_as_unread(mail, email_id):
+    """Mark the email as unread by removing the SEEN flag."""
+    try:
+        mail.store(email_id, '-FLAGS', '\\Seen')
+        logging.info(f"Marked email ID {email_id} as unread.")
+    except Exception as e:
+        logging.error(f"Failed to mark email ID {email_id} as unread: {e}")
 
 def main():
     try:
@@ -161,11 +214,20 @@ def main():
             logging.info("No new emails found.")
             return
 
+        # Load the list of processed email IDs
+        processed_emails = load_processed_emails()
+
         overall_report = ""
         for email_id in email_ids:
-            malicious_report = process_email(email_id, mail)
-            if malicious_report:
-                overall_report += malicious_report
+            email_id_str = email_id.decode()  # Convert bytes to string for comparison
+            if email_id_str not in processed_emails:
+                malicious_report = process_email(email_id, mail)
+                if malicious_report:
+                    overall_report += malicious_report
+                # Save the email ID after processing
+                save_processed_email(email_id_str)
+            else:
+                logging.info(f"Skipping already processed email ID {email_id_str}")
 
         if overall_report:
             send_report(overall_report)
