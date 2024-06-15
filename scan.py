@@ -113,18 +113,44 @@ def send_report(report):
 
 def process_email(email_id, mail):
     """Process a single email to extract and check URLs."""
-    status, data = mail.fetch(email_id, '(RFC822)')
-    msg = email.message_from_bytes(data[0][1])
-    email_body = msg.get_payload(decode=True).decode()
-    
-    urls = extract_links(email_body)
-    malicious_report = ""
-    if urls:
-        for url in urls:
-            malicious_count = check_link_virustotal(url)
-            if isinstance(malicious_count, int) and malicious_count > 0:
-                malicious_report += f"URL: {url}\nMalicious Reports: {malicious_count}\n\n"
-    return malicious_report
+    try:
+        status, data = mail.fetch(email_id, '(RFC822)')
+        msg = email.message_from_bytes(data[0][1])
+        email_body = None
+
+        if msg.is_multipart():
+            # If the email is multipart, extract the payloads
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                content_disposition = str(part.get("Content-Disposition"))
+
+                # Check if the content is text/plain or text/html and not an attachment
+                if "attachment" not in content_disposition:
+                    if content_type == "text/plain":
+                        email_body = part.get_payload(decode=True).decode()
+                        break  # Use the plain text version if available
+                    elif content_type == "text/html" and not email_body:
+                        email_body = part.get_payload(decode=True).decode()
+        else:
+            # Non-multipart message, directly get the payload
+            email_body = msg.get_payload(decode=True).decode()
+
+        if not email_body:
+            logging.warning(f"No suitable content found in email ID {email_id}.")
+            return ""
+
+        urls = extract_links(email_body)
+        malicious_report = ""
+        if urls:
+            for url in urls:
+                malicious_count = check_link_virustotal(url)
+                if isinstance(malicious_count, int) and malicious_count > 0:
+                    malicious_report += f"URL: {url}\nMalicious Reports: {malicious_count}\n\n"
+        return malicious_report
+
+    except Exception as e:
+        logging.error(f"Failed to process email ID {email_id}: {e}")
+        return ""
 
 def main():
     try:
