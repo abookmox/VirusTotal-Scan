@@ -13,7 +13,6 @@ from html import escape
 from bs4 import BeautifulSoup
 from time import time
 from time import sleep
-import base64
 
 # Load environment variables from .env file if present
 load_dotenv()
