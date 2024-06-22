@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from requests.exceptions import RequestException
 from html import escape
 from bs4 import BeautifulSoup
+from time import time
+from time import sleep
+import base64
 
 # Load environment variables from .env file if present
 load_dotenv()
@@ -27,6 +30,7 @@ SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
 
 # File to store processed email IDs
 PROCESSED_EMAILS_FILE = 'processed_emails.txt'
+REPORT_EMAIL_TITLE = 'Malicious URLs Detected in Recent Emails'
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -100,47 +104,28 @@ def clean_url(url):
 
 def check_link_virustotal(url):
     """Check a single URL on VirusTotal and return the malicious count."""
-    headers = {
-        'x-apikey': VIRUSTOTAL_API_KEY
-    }
     try:
-        # Step 1: Submit the URL for analysis
-        response = requests.post(
-            'https://www.virustotal.com/api/v3/urls',
-            headers=headers,
-            data={'url': url}
+        # Use the GET request with the query string similar to the curl command
+        response = requests.get(
+            'https://www.virustotal.com/vtapi/v2/url/report',
+            params={
+                'apikey': VIRUSTOTAL_API_KEY,
+                'resource': url
+            }
         )
-        response.raise_for_status()
-        
-        analysis_id = response.json().get('data', {}).get('id')
-        if not analysis_id:
-            logging.warning(f"Submission failed for URL: {url}")
-            return "Error: Submission failed"
-        
-        # Step 2: Polling to get the analysis results
-        analysis_url = f'https://www.virustotal.com/api/v3/analyses/{analysis_id}'
-        for attempt in range(5):  # Retry up to 5 times with delays
-            analysis_response = requests.get(analysis_url, headers=headers)
-            if analysis_response.status_code == 200:
-                result = analysis_response.json()
-                status = result.get('data', {}).get('attributes', {}).get('status')
-                
-                if status == "completed":
-                    # Extract the malicious count
-                    malicious_count = result['data']['attributes']['stats']['malicious']
-                    logging.info(f"Checked URL {url}: {malicious_count} malicious reports.")
-                    return malicious_count
-                
-                logging.info(f"Waiting for analysis results for URL {url}... attempt {attempt + 1}")
-                time.sleep(5)  # Wait for 5 seconds before the next poll
-            else:
-                logging.error(f"Error fetching analysis results for URL {url}: {analysis_response.status_code}")
-                break
-        
-        logging.warning(f"Analysis not completed for URL: {url} after multiple attempts.")
-        return "Error: Analysis not completed"
+        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx, 5xx)
 
-    except RequestException as e:
+        # Process the response to get the malicious count
+        result = response.json()
+        if 'positives' in result and 'total' in result:
+            malicious_count = result['positives']
+            logging.info(f"Checked URL {url}: {malicious_count} malicious reports.")
+            return malicious_count
+        else:
+            logging.warning(f"No analysis results found for URL: {url}")
+            return "Error: No analysis results found"
+
+    except requests.RequestException as e:
         logging.error(f"Request failed for URL {url}: {e}")
         return f"Error: Unable to check - {str(e)}"
 
@@ -151,7 +136,7 @@ def send_report(report):
         msg = MIMEMultipart()
         msg['From'] = SMTP_USERNAME
         msg['To'] = EMAIL_ADDRESS
-        msg['Subject'] = 'Malicious URLs Detected in Recent Emails'
+        msg['Subject'] = REPORT_EMAIL_TITLE
         
         body = 'Malicious URL Scan Report:\n\n' + report
         msg.attach(MIMEText(body, 'plain'))
@@ -172,6 +157,13 @@ def process_email(email_id, mail):
     try:
         status, data = mail.fetch(email_id, '(RFC822)')
         msg = email.message_from_bytes(data[0][1])
+
+        # Check if the email subject matches REPORT_EMAIL_TITLE and skip if it does
+        subject = msg.get('Subject', '')
+        if subject == REPORT_EMAIL_TITLE:
+            logging.info(f"Skipping email ID {email_id} with subject matching report title.")
+            return ""
+
         email_body = None
 
         if msg.is_multipart():
@@ -211,6 +203,7 @@ def process_email(email_id, mail):
     except Exception as e:
         logging.error(f"Failed to process email ID {email_id}: {e}")
         return ""
+
 
 def mark_as_unread(mail, email_id):
     """Mark the email as unread by removing the SEEN flag."""
@@ -254,3 +247,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
