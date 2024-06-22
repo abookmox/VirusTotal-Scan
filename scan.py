@@ -5,14 +5,13 @@ import re
 import requests
 import smtplib
 import logging
+import hashlib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
-from requests.exceptions import RequestException
 from html import escape
 from bs4 import BeautifulSoup
-from time import time
-from time import sleep
+from io import BytesIO
 
 # Load environment variables from .env file if present
 load_dotenv()
@@ -29,7 +28,7 @@ SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
 
 # File to store processed email IDs
 PROCESSED_EMAILS_FILE = 'processed_emails.txt'
-REPORT_EMAIL_TITLE = 'Malicious URLs Detected in Recent Emails'
+REPORT_EMAIL_TITLE = 'Malicious URLs and Attachments Detected in Recent Emails'
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -104,7 +103,6 @@ def clean_url(url):
 def check_link_virustotal(url):
     """Check a single URL on VirusTotal and return the malicious count."""
     try:
-        # Use the GET request with the query string similar to the curl command
         response = requests.get(
             'https://www.virustotal.com/vtapi/v2/url/report',
             params={
@@ -114,7 +112,6 @@ def check_link_virustotal(url):
         )
         response.raise_for_status()  # Raise an HTTPError for bad responses (4xx, 5xx)
 
-        # Process the response to get the malicious count
         result = response.json()
         if 'positives' in result and 'total' in result:
             malicious_count = result['positives']
@@ -128,6 +125,111 @@ def check_link_virustotal(url):
         logging.error(f"Request failed for URL {url}: {e}")
         return f"Error: Unable to check - {str(e)}"
 
+def calculate_hash_from_bytes(byte_data):
+    """Calculate the SHA-256 hash from bytes."""
+    sha256_hash = hashlib.sha256()
+    sha256_hash.update(byte_data)
+    return sha256_hash.hexdigest()
+
+def check_file_virustotal(byte_data, filename):
+    """Check a file on VirusTotal using its hash and return the scan result."""
+    file_hash = calculate_hash_from_bytes(byte_data)
+    logging.info(f"Calculated SHA-256 hash for {filename}: {file_hash}")
+    
+    try:
+        params = {'apikey': VIRUSTOTAL_API_KEY, 'resource': file_hash}
+        response = requests.get(
+            'https://www.virustotal.com/vtapi/v2/file/report',
+            params=params
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        if 'positives' in result and 'total' in result:
+            malicious_count = result['positives']
+            logging.info(f"File hash {file_hash}: {malicious_count} malicious reports.")
+            return malicious_count
+        else:
+            logging.warning(f"No analysis results found for file hash: {file_hash}")
+            return "Error: No analysis results found"
+
+    except requests.RequestException as e:
+        logging.error(f"Request failed for file hash {file_hash}: {e}")
+        return f"Error: Unable to check - {str(e)}"
+
+def process_email(email_id, mail):
+    """Process a single email to extract and check URLs and attachments."""
+    try:
+        status, data = mail.fetch(email_id, '(RFC822)')
+        msg = email.message_from_bytes(data[0][1])
+
+        # Check if the email subject matches REPORT_EMAIL_TITLE and skip if it does
+        subject = msg.get('Subject', '')
+        if subject == REPORT_EMAIL_TITLE:
+            logging.info(f"Skipping email ID {email_id} with subject matching report title.")
+            return ""
+
+        email_body = None
+        attachments = []
+
+        if msg.is_multipart():
+            # If the email is multipart, extract the payloads
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                content_disposition = str(part.get("Content-Disposition"))
+
+                # Check if the content is text/plain or text/html and not an attachment
+                if "attachment" in content_disposition:
+                    filename = part.get_filename()
+                    if filename:
+                        byte_data = part.get_payload(decode=True)
+                        attachments.append((byte_data, filename))
+                elif content_type == "text/plain":
+                    if not email_body:
+                        email_body = part.get_payload(decode=True).decode()
+                elif content_type == "text/html":
+                    if not email_body:  # Prefer plain text if available, otherwise use HTML
+                        email_body = part.get_payload(decode=True).decode()
+        else:
+            # Non-multipart message, directly get the payload
+            email_body = msg.get_payload(decode=True).decode()
+
+        if not email_body:
+            logging.warning(f"No suitable content found in email ID {email_id}.")
+            return ""
+
+        urls = extract_links(email_body)
+        malicious_report = ""
+        
+        # Check URLs
+        if urls:
+            for url in urls:
+                malicious_count = check_link_virustotal(url)
+                if isinstance(malicious_count, int) and malicious_count > 0:
+                    malicious_report += f"URL: {url}\nMalicious Reports: {malicious_count}\n\n"
+        
+        # Check Attachments
+        for byte_data, filename in attachments:
+            malicious_count = check_file_virustotal(byte_data, filename)
+            if isinstance(malicious_count, int) and malicious_count > 0:
+                malicious_report += f"Attachment: {filename}\nMalicious Reports: {malicious_count}\n\n"
+
+        # Mark the email as unread after processing
+        mark_as_unread(mail, email_id)
+        
+        return malicious_report
+
+    except Exception as e:
+        logging.error(f"Failed to process email ID {email_id}: {e}")
+        return ""
+
+def mark_as_unread(mail, email_id):
+    """Mark the email as unread by removing the SEEN flag."""
+    try:
+        mail.store(email_id, '-FLAGS', '\\Seen')
+        logging.info(f"Marked email ID {email_id} as unread.")
+    except Exception as e:
+        logging.error(f"Failed to mark email ID {email_id} as unread: {e}")
 
 def send_report(report):
     """Send the report via email."""
@@ -137,7 +239,7 @@ def send_report(report):
         msg['To'] = EMAIL_ADDRESS
         msg['Subject'] = REPORT_EMAIL_TITLE
         
-        body = 'Malicious URL Scan Report:\n\n' + report
+        body = 'Malicious URL and Attachment Scan Report:\n\n' + report
         msg.attach(MIMEText(body, 'plain'))
         
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
@@ -150,67 +252,6 @@ def send_report(report):
     except smtplib.SMTPException as e:
         logging.error(f"Failed to send report: {e}")
         raise
-
-def process_email(email_id, mail):
-    """Process a single email to extract and check URLs."""
-    try:
-        status, data = mail.fetch(email_id, '(RFC822)')
-        msg = email.message_from_bytes(data[0][1])
-
-        # Check if the email subject matches REPORT_EMAIL_TITLE and skip if it does
-        subject = msg.get('Subject', '')
-        if subject == REPORT_EMAIL_TITLE:
-            logging.info(f"Skipping email ID {email_id} with subject matching report title.")
-            return ""
-
-        email_body = None
-
-        if msg.is_multipart():
-            # If the email is multipart, extract the payloads
-            for part in msg.walk():
-                content_type = part.get_content_type()
-                content_disposition = str(part.get("Content-Disposition"))
-
-                # Check if the content is text/plain or text/html and not an attachment
-                if "attachment" not in content_disposition:
-                    if content_type == "text/plain":
-                        email_body = part.get_payload(decode=True).decode()
-                        break  # Use the plain text version if available
-                    elif content_type == "text/html" and not email_body:
-                        email_body = part.get_payload(decode=True).decode()
-        else:
-            # Non-multipart message, directly get the payload
-            email_body = msg.get_payload(decode=True).decode()
-
-        if not email_body:
-            logging.warning(f"No suitable content found in email ID {email_id}.")
-            return ""
-
-        urls = extract_links(email_body)
-        malicious_report = ""
-        if urls:
-            for url in urls:
-                malicious_count = check_link_virustotal(url)
-                if isinstance(malicious_count, int) and malicious_count > 0:
-                    malicious_report += f"URL: {url}\nMalicious Reports: {malicious_count}\n\n"
-
-        # Mark the email as unread after processing
-        mark_as_unread(mail, email_id)
-        
-        return malicious_report
-
-    except Exception as e:
-        logging.error(f"Failed to process email ID {email_id}: {e}")
-        return ""
-
-
-def mark_as_unread(mail, email_id):
-    """Mark the email as unread by removing the SEEN flag."""
-    try:
-        mail.store(email_id, '-FLAGS', '\\Seen')
-        logging.info(f"Marked email ID {email_id} as unread.")
-    except Exception as e:
-        logging.error(f"Failed to mark email ID {email_id} as unread: {e}")
 
 def main():
     try:
@@ -238,14 +279,11 @@ def main():
 
         if overall_report:
             send_report(overall_report)
-            logging.info("Malicious URLs detected and report sent.")
+            logging.info("Malicious URLs and attachments detected and report sent.")
         else:
-            logging.info("No malicious URLs found.")
+            logging.info("No malicious URLs or attachments found.")
     except Exception as e:
         logging.error(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     main()
-
-
-
