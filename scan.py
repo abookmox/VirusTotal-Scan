@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from html import escape
 from bs4 import BeautifulSoup
 from io import BytesIO
+from base64 import b64encode
+from PIL import Image, ImageDraw
 
 # Load environment variables from .env file if present
 load_dotenv()
@@ -30,7 +32,7 @@ SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
 PROCESSED_EMAILS_FILE = 'processed_emails.txt'
 REPORT_EMAIL_TITLE = 'Malicious URLs and Attachments Detected in Recent Emails'
 
-# Set up logging
+# Set up logging, excluding sensitive information
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def load_processed_emails():
@@ -47,7 +49,7 @@ def save_processed_email(email_id):
         file.write(f"{email_id}\n")
 
 def access_email():
-    """Access and login to the email server."""
+    """Access and login to the email server securely."""
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
         mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
@@ -59,7 +61,7 @@ def access_email():
         raise
 
 def fetch_unread_emails(mail):
-    """Fetch unread emails from the inbox."""
+    """Fetch unread emails from the inbox securely."""
     try:
         status, messages = mail.search(None, '(UNSEEN)')
         email_ids = messages[0].split()
@@ -70,7 +72,7 @@ def fetch_unread_emails(mail):
         raise
 
 def extract_links(email_body):
-    """Extract and clean URLs from the email body."""
+    """Extract and sanitize URLs from the email body."""
     urls = set()  # Use a set to avoid duplicate URLs
 
     # Use BeautifulSoup to parse the HTML content
@@ -93,37 +95,45 @@ def extract_links(email_body):
 
 def clean_url(url):
     """Sanitize and clean a URL."""
-    # Decode HTML entities and remove extra HTML characters
-    clean_url = url.split('&')[0]  # This removes trailing parameters after '&'
-    clean_url = clean_url.split('"')[0]  # This removes trailing characters after '"'
-    clean_url = clean_url.split('<')[0]  # This removes trailing characters after '<'
-    clean_url = clean_url.split('>')[0]  # This removes trailing characters after '>'
-    return clean_url.strip()
+    return re.sub(r'[^\w\-._~:/?#[\]@!$&\'()*+,;=%]', '', url)
 
 def check_link_virustotal(url):
-    """Check a single URL on VirusTotal and return the malicious count."""
+    """Check a single URL on VirusTotal and return the detailed scan results."""
     try:
         response = requests.get(
             'https://www.virustotal.com/vtapi/v2/url/report',
             params={
                 'apikey': VIRUSTOTAL_API_KEY,
                 'resource': url
-            }
+            },
+            timeout=10  # Set a timeout for the request
         )
         response.raise_for_status()  # Raise an HTTPError for bad responses (4xx, 5xx)
 
         result = response.json()
-        if 'positives' in result and 'total' in result:
+        if 'scans' in result and 'positives' in result:
             malicious_count = result['positives']
-            logging.info(f"Checked URL {url}: {malicious_count} malicious reports.")
-            return malicious_count
+            total_count = result['total']
+            details = []
+
+            for engine, scan in result['scans'].items():
+                if scan['detected']:
+                    details.append(f"{engine}: {scan['result']}")
+
+            logging.info(f"Checked URL {url}: {malicious_count}/{total_count} malicious reports.")
+            return {
+                'malicious_count': malicious_count,
+                'total_count': total_count,
+                'details': details,
+                'permalink': result.get('permalink')
+            }
         else:
             logging.warning(f"No analysis results found for URL: {url}")
-            return "Error: No analysis results found"
+            return None
 
     except requests.RequestException as e:
         logging.error(f"Request failed for URL {url}: {e}")
-        return f"Error: Unable to check - {str(e)}"
+        return None
 
 def calculate_hash_from_bytes(byte_data):
     """Calculate the SHA-256 hash from bytes."""
@@ -132,7 +142,7 @@ def calculate_hash_from_bytes(byte_data):
     return sha256_hash.hexdigest()
 
 def check_file_virustotal(byte_data, filename):
-    """Check a file on VirusTotal using its hash and return the scan result."""
+    """Check a file on VirusTotal using its hash and return the detailed scan results."""
     file_hash = calculate_hash_from_bytes(byte_data)
     logging.info(f"Calculated SHA-256 hash for {filename}: {file_hash}")
     
@@ -140,34 +150,51 @@ def check_file_virustotal(byte_data, filename):
         params = {'apikey': VIRUSTOTAL_API_KEY, 'resource': file_hash}
         response = requests.get(
             'https://www.virustotal.com/vtapi/v2/file/report',
-            params=params
+            params=params,
+            timeout=10  # Set a timeout for the request
         )
         response.raise_for_status()
         
         result = response.json()
-        if 'positives' in result and 'total' in result:
+        if 'scans' in result and 'positives' in result:
             malicious_count = result['positives']
-            logging.info(f"File hash {file_hash}: {malicious_count} malicious reports.")
-            return malicious_count
+            total_count = result['total']
+            details = []
+
+            for engine, scan in result['scans'].items():
+                if scan['detected']:
+                    details.append(f"{engine}: {scan['result']}")
+
+            logging.info(f"File hash {file_hash}: {malicious_count}/{total_count} malicious reports.")
+            return {
+                'filename': filename,
+                'malicious_count': malicious_count,
+                'total_count': total_count,
+                'details': details,
+                'permalink': result.get('permalink')
+            }
         else:
             logging.warning(f"No analysis results found for file hash: {file_hash}")
-            return "Error: No analysis results found"
+            return None
 
     except requests.RequestException as e:
         logging.error(f"Request failed for file hash {file_hash}: {e}")
-        return f"Error: Unable to check - {str(e)}"
+        return None
 
 def process_email(email_id, mail):
-    """Process a single email to extract and check URLs and attachments."""
+    """Process a single email to extract and check URLs and attachments securely."""
     try:
         status, data = mail.fetch(email_id, '(RFC822)')
         msg = email.message_from_bytes(data[0][1])
 
+        # Extract email sender and subject
+        sender = msg.get('From', 'Unknown sender')
+        subject = msg.get('Subject', 'No subject')
+
         # Check if the email subject matches REPORT_EMAIL_TITLE and skip if it does
-        subject = msg.get('Subject', '')
         if subject == REPORT_EMAIL_TITLE:
             logging.info(f"Skipping email ID {email_id} with subject matching report title.")
-            return ""
+            return "", None, None, None
 
         email_body = None
         attachments = []
@@ -196,32 +223,49 @@ def process_email(email_id, mail):
 
         if not email_body:
             logging.warning(f"No suitable content found in email ID {email_id}.")
-            return ""
+            return "", None, None, None
 
         urls = extract_links(email_body)
         malicious_report = ""
-        
+        findings = []
+
         # Check URLs
         if urls:
             for url in urls:
-                malicious_count = check_link_virustotal(url)
-                if isinstance(malicious_count, int) and malicious_count > 0:
-                    malicious_report += f"URL: {url}\nMalicious Reports: {malicious_count}\n\n"
+                scan_result = check_link_virustotal(url)
+                if scan_result:
+                    findings.append({
+                        'type': 'URL',
+                        'value': url,
+                        'details': scan_result['details'],
+                        'malicious_count': scan_result['malicious_count'],
+                        'total_count': scan_result['total_count'],
+                        'permalink': scan_result['permalink']
+                    })
+                    malicious_report += f"URL: {url}\nMalicious Reports: {scan_result['malicious_count']}/{scan_result['total_count']}\n\n"
         
         # Check Attachments
         for byte_data, filename in attachments:
-            malicious_count = check_file_virustotal(byte_data, filename)
-            if isinstance(malicious_count, int) and malicious_count > 0:
-                malicious_report += f"Attachment: {filename}\nMalicious Reports: {malicious_count}\n\n"
+            scan_result = check_file_virustotal(byte_data, filename)
+            if scan_result:
+                findings.append({
+                    'type': 'Attachment',
+                    'value': filename,
+                    'details': scan_result['details'],
+                    'malicious_count': scan_result['malicious_count'],
+                    'total_count': scan_result['total_count'],
+                    'permalink': scan_result['permalink']
+                })
+                malicious_report += f"Attachment: {filename}\nMalicious Reports: {scan_result['malicious_count']}/{scan_result['total_count']}\n\n"
 
         # Mark the email as unread after processing
         mark_as_unread(mail, email_id)
         
-        return malicious_report
+        return malicious_report, sender, subject, findings
 
     except Exception as e:
         logging.error(f"Failed to process email ID {email_id}: {e}")
-        return ""
+        return "", None, None, None
 
 def mark_as_unread(mail, email_id):
     """Mark the email as unread by removing the SEEN flag."""
@@ -231,16 +275,98 @@ def mark_as_unread(mail, email_id):
     except Exception as e:
         logging.error(f"Failed to mark email ID {email_id} as unread: {e}")
 
-def send_report(report):
-    """Send the report via email."""
+def generate_severity_graphic(malicious_count, total_count):
+    """Generate a visually appealing bar graphic to represent the severity of findings."""
+    width = 300
+    height = 50
+    bar_length = int((malicious_count / total_count) * width)
+    
+    # Create the image
+    image = Image.new('RGB', (width, height), color='white')
+    draw = ImageDraw.Draw(image)
+
+    # Draw the severity bar with gradient color
+    draw.rectangle([0, 0, bar_length, height], fill='red')
+    draw.rectangle([bar_length, 0, width, height], fill='lightgrey')
+
+    # Save to a bytes buffer
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    img_str = b64encode(buffered.getvalue()).decode()
+    return img_str  # Return the base64-encoded image string
+
+def send_report(sender, subject, findings):
+    """Send the report via email securely."""
     try:
         msg = MIMEMultipart()
         msg['From'] = SMTP_USERNAME
         msg['To'] = EMAIL_ADDRESS
         msg['Subject'] = REPORT_EMAIL_TITLE
         
-        body = 'Malicious URL and Attachment Scan Report:\n\n' + report
-        msg.attach(MIMEText(body, 'plain'))
+        # Build the HTML report
+        html_template = """
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; color: #333; margin: 0; padding: 20px; background-color: #f4f4f9; }}
+                h2, h3 {{ color: #2e6da4; }}
+                .report-section {{ background-color: #fff; border: 1px solid #ddd; border-radius: 5px; padding: 20px; margin-bottom: 20px; text-align: center; }}
+                .severity-bar img {{ max-width: 100%; height: auto; }}
+                .redirect-button {{ background-color: #2e6da4; color: #fff; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px; text-decoration: none; display: inline-block; }}
+                .redirect-button:hover {{ background-color: #204d74; }}
+                .footer {{ font-size: 0.8em; color: #666; text-align: center; margin-top: 20px; }}
+                .bar-caption {{ text-align: center; margin-top: 10px; font-size: 0.9em; color: #555; }}
+                .url-text {{ word-wrap: break-word; font-size: 0.9em; color: #2e6da4; }}
+            </style>
+        </head>
+        <body>
+            <h2>Malicious URL and Attachment Scan Report</h2>
+            <p><strong>Sender:</strong> {sender}</p>
+            <p><strong>Subject:</strong> {subject}</p>
+            <hr>
+            {findings_html}
+            <div class="footer">
+                <p>Generated by VirusTotal Scanner</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        findings_html = ""
+        for i, finding in enumerate(findings, start=1):
+            graphic = generate_severity_graphic(finding['malicious_count'], finding['total_count'])
+            findings_html += f"""
+            <div class="report-section">
+                <h3>Dangerous Content Detected!</h3>
+                <div class="severity-bar">
+                    <img src="data:image/png;base64,{graphic}" alt="Severity Bar">
+                </div>
+                <div class="bar-caption">{finding['malicious_count']}/{finding['total_count']} flagged this as malicious</div>
+            """
+            if finding['type'] == 'URL':
+                findings_html += f"""
+                <p class="url-text"><strong>MALICIOUS URL (don't click it!):</strong> <span>{escape(finding['value'])}</span></p>
+                <a class="redirect-button" href="{finding['permalink']}" target="_blank">View on VirusTotal</a>
+                """
+            elif finding['type'] == 'Attachment':
+                findings_html += f"""
+                <h3>Malicious Attachment</h3>
+                <p class="url-text"><strong>Name:</strong> <span>{escape(finding['value'])}</span></p>
+                <a class="redirect-button" href="{finding['permalink']}" target="_blank">View on VirusTotal</a>
+                """
+            findings_html += "</div>"
+        
+        # Fill in the template with actual data
+        try:
+            html_content = html_template.format(sender=escape(sender), subject=escape(subject), findings_html=findings_html)
+        except KeyError as ke:
+            logging.error(f"Key error in HTML formatting: {ke}")
+            return
+
+        # Log the generated HTML content for debugging
+        logging.debug(f"Generated HTML content:\n{html_content}")
+
+        msg.attach(MIMEText(html_content, 'html'))
         
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
         server.starttls()
@@ -252,6 +378,11 @@ def send_report(report):
     except smtplib.SMTPException as e:
         logging.error(f"Failed to send report: {e}")
         raise
+    except Exception as e:
+        logging.error(f"Unexpected error during email sending: {e}")
+        raise
+
+
 
 def main():
     try:
@@ -265,23 +396,17 @@ def main():
         # Load the list of processed email IDs
         processed_emails = load_processed_emails()
 
-        overall_report = ""
         for email_id in email_ids:
             email_id_str = email_id.decode()  # Convert bytes to string for comparison
             if email_id_str not in processed_emails:
-                malicious_report = process_email(email_id, mail)
+                malicious_report, sender, subject, findings = process_email(email_id, mail)
                 if malicious_report:
-                    overall_report += malicious_report
+                    send_report(sender, subject, findings)
                 # Save the email ID after processing
                 save_processed_email(email_id_str)
             else:
                 logging.info(f"Skipping already processed email ID {email_id_str}")
 
-        if overall_report:
-            send_report(overall_report)
-            logging.info("Malicious URLs and attachments detected and report sent.")
-        else:
-            logging.info("No malicious URLs or attachments found.")
     except Exception as e:
         logging.error(f"An error occurred: {e}")
 
